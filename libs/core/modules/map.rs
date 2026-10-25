@@ -1027,8 +1027,10 @@ impl ModuleMap {
           // Fall back to lazy ESM sources for bare internal specifiers (e.g.
           // `node:_http_common` from `node:_http_outgoing`) that the
           // user-facing loader doesn't know about. If the specifier matches
-          // a registered lazy ESM entry, use it verbatim.
-          if self.has_lazy_esm_source(&import_specifier)
+          // a registered lazy ESM entry, use it verbatim, but only during
+          // trusted internal loading. Never discard an embedder policy denial.
+          if self.is_internal_referrer(name.as_ref())
+            && self.has_lazy_esm_source(&import_specifier)
             && let Ok(parsed) = ModuleSpecifier::parse(&import_specifier)
           {
             parsed
@@ -1569,8 +1571,11 @@ impl ModuleMap {
     // resolves `lazy_loaded_esm` entries), so checking before
     // `resolve_sync` ensures the synthetic dispatch wins over a loader
     // "cannot resolve" error. `node:foo` specifiers are their own
-    // canonical form, so no further resolution is needed.
-    if self.has_synthetic_esm_module(specifier) {
+    // canonical form, so no further resolution is needed. Only trusted
+    // internal loads may bypass the embedder's resolver.
+    if self.is_internal_referrer(referrer)
+      && self.has_synthetic_esm_module(specifier)
+    {
       if let Some(id) = self.get_id(specifier, &RequestedModuleType::None)
         && let Some(handle) = self.get_handle(id)
       {
@@ -1599,8 +1604,10 @@ impl ModuleMap {
           // doesn't know how to resolve (only public `node:` modules go
           // through the normal path). The lazy_esm registry has them by
           // exact specifier, so if the specifier is a registered lazy ESM
-          // entry, use it verbatim instead of erroring.
-          if self.has_lazy_esm_source(specifier)
+          // entry, use it verbatim instead of erroring during trusted internal
+          // loading. User imports must retain the embedder's resolver error.
+          if self.is_internal_referrer(referrer)
+            && self.has_lazy_esm_source(specifier)
             && let Ok(parsed) = ModuleSpecifier::parse(specifier)
           {
             parsed

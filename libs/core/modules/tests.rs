@@ -2468,6 +2468,111 @@ fn lazy_loaded_internal_module_ignores_loader_remapping() {
     .unwrap();
 }
 
+/// A registered runtime builtin must not turn a loader's policy denial into
+/// an implicit success. Internal bootstrap still bypasses the external loader.
+#[tokio::test]
+async fn lazy_and_synthetic_modules_respect_loader_denial() {
+  struct DenyingLoader;
+  impl ModuleLoader for DenyingLoader {
+    fn resolve(
+      &self,
+      specifier: &str,
+      referrer: &str,
+      _kind: ResolutionKind,
+    ) -> ModuleResolveResponse {
+      if specifier.starts_with("node:") {
+        return Err(JsErrorBox::generic("builtin denied by embedder"));
+      }
+      resolve_import(specifier, referrer).map_err(JsErrorBox::from_err)
+    }
+
+    fn load(
+      &self,
+      _specifier: &ModuleSpecifier,
+      _referrer: Option<&ModuleLoadReferrer>,
+      _options: ModuleLoadOptions,
+    ) -> ModuleLoadResponse {
+      panic!("denied builtins must not reach load")
+    }
+  }
+
+  deno_core::extension!(
+    denied_builtins,
+    lazy_loaded_esm = [
+      dir "modules/testdata",
+      "node:denied_lazy" = "lazy_loaded_shared.js",
+    ],
+    synthetic_esm = [
+      "node:denied_synthetic" = "ext:test/not_loaded.js"
+    ]
+  );
+
+  let mut runtime = JsRuntime::new(RuntimeOptions {
+    module_loader: Some(Rc::new(DenyingLoader)),
+    extensions: vec![denied_builtins::init()],
+    ..Default::default()
+  });
+
+  for specifier in ["node:denied_lazy", "node:denied_synthetic"] {
+    let source = format!("import '{specifier}';");
+    let error = runtime
+      .load_main_es_module_from_code(
+        &resolve_url("file:///main.js").unwrap(),
+        source,
+      )
+      .await
+      .unwrap_err();
+    assert!(
+      error.to_string().contains("builtin denied by embedder"),
+      "{error}"
+    );
+
+    // A script's sourceURL is user-controlled and must not grant internal access.
+    for origin in [
+      "file:///dynamic.js",
+      "ext:spoofed/module.js",
+      "node:spoofed",
+    ] {
+      let source = format!(
+        r#"
+        import('{specifier}').then(
+          () => {{ throw new Error('unexpected builtin access'); }},
+          e => {{ if (!String(e).includes('builtin denied by embedder')) throw e; }}
+        );
+        //# sourceURL={origin}
+      "#
+      );
+      let quoted = serde_json::to_string(&source).unwrap();
+      for script in [
+        source,
+        format!("eval({quoted})"),
+        format!("Function({quoted})()"),
+      ] {
+        runtime.execute_script("file:///caller.js", script).unwrap();
+        runtime.run_event_loop(Default::default()).await.unwrap();
+      }
+    }
+  }
+
+  runtime.lazy_load_es_module_with_code(
+    "ext:test/bootstrap.js",
+    "import { value } from 'node:denied_lazy'; if (value !== 'shared') throw Error(value);",
+  ).unwrap();
+
+  // Even after internal bootstrap has cached the builtin, user access is denied.
+  let error = runtime
+    .load_main_es_module_from_code(
+      &resolve_url("file:///after_bootstrap.js").unwrap(),
+      "import 'node:denied_lazy';",
+    )
+    .await
+    .unwrap_err();
+  assert!(
+    error.to_string().contains("builtin denied by embedder"),
+    "{error}"
+  );
+}
+
 #[test]
 fn import_meta_filename_dirname() {
   #[cfg(not(target_os = "windows"))]
